@@ -215,7 +215,7 @@ void cleanup_tournament() {
 // YAGS bp
 
 int custom_history_bits = 13;
-int custom_cache_bits = 10, custom_cache_tag_bits = 6;
+int custom_cache_bits = 10, custom_cache_tag_bits = 5;
 const int nway = 2;
 uint8_t *choicebht_custom, *t_cache_tags[2], *t_cache_2bcs[2], *nt_cache_tags[2], *nt_cache_2bcs[2], *t_cache_LRU, *nt_cache_LRU;
 uint64_t ghistory;
