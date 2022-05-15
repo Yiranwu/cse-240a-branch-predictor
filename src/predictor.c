@@ -7,6 +7,7 @@
 //========================================================//
 #include <stdio.h>
 #include <math.h>
+#include <stdbool.h>
 #include "predictor.h"
 
 //
@@ -141,7 +142,7 @@ void cleanup_gshare() {
     free(bht_gshare);
 }
 
-
+// gshare/bimodal tournament bp
 uint8_t *gbht_tournament, *lbht_tournament, *choicebht_tournament;
 uint64_t ghistory, *lhistory;
 
@@ -181,7 +182,6 @@ uint8_t tournament_predict(uint32_t pc) {
 
     // choice true -> local pred
     return choice?lpred:gpred;
-    //return gpred;
 }
 
 void train_tournament(uint32_t pc, uint8_t outcome) {
@@ -195,7 +195,6 @@ void train_tournament(uint32_t pc, uint8_t outcome) {
     uint8_t *choiceEntry = &choicebht_tournament[pcindex];
 
     uint8_t lpred = saturate_counter_predict(*lentry), gpred = saturate_counter_predict(*gentry), choice = saturate_counter_predict(*choiceEntry);
-    uint8_t pred = choice ? lpred : gpred;
 
     saturate_counter_update(lentry, outcome);
     saturate_counter_update(gentry, outcome);
@@ -213,6 +212,151 @@ void cleanup_tournament() {
     free(lhistory);
 }
 
+// YAGS bp
+
+int custom_history_bits = 13;
+int custom_cache_bits = 10, custom_cache_tag_bits = 6;
+const int nway = 2;
+uint8_t *choicebht_custom, *t_cache_tags[2], *t_cache_2bcs[2], *nt_cache_tags[2], *nt_cache_2bcs[2], *t_cache_LRU, *nt_cache_LRU;
+uint64_t ghistory;
+
+void init_custom() {
+    int choicebht_entries = 1 << custom_history_bits;
+    choicebht_custom = (uint8_t *) malloc(choicebht_entries * sizeof(uint8_t));
+    for (int i = 0; i < choicebht_entries; i++) {
+        choicebht_custom[i] = WT;
+    }
+    int cache_entries = 1 << custom_cache_bits;
+    t_cache_tags[0] = (uint8_t *) malloc(cache_entries * sizeof(uint8_t));
+    t_cache_tags[1] = (uint8_t *) malloc(cache_entries * sizeof(uint8_t));
+    t_cache_2bcs[0] = (uint8_t *) malloc(cache_entries * sizeof(uint8_t));
+    t_cache_2bcs[1] = (uint8_t *) malloc(cache_entries * sizeof(uint8_t));
+    nt_cache_tags[0] = (uint8_t *) malloc(cache_entries * sizeof(uint8_t));
+    nt_cache_tags[1] = (uint8_t *) malloc(cache_entries * sizeof(uint8_t));
+    nt_cache_2bcs[0] = (uint8_t *) malloc(cache_entries * sizeof(uint8_t));
+    nt_cache_2bcs[1] = (uint8_t *) malloc(cache_entries * sizeof(uint8_t));
+    t_cache_LRU = (uint8_t *) malloc(cache_entries * sizeof(uint8_t));
+    nt_cache_LRU = (uint8_t *) malloc(cache_entries * sizeof(uint8_t));
+    for (int i = 0; i < cache_entries; i++) {
+        t_cache_tags[0][i] = 0;
+        t_cache_tags[1][i] = 0;
+        t_cache_2bcs[0][i] = WN;
+        t_cache_2bcs[1][i] = WN;
+        nt_cache_tags[0][i] = 0;
+        nt_cache_tags[1][i] = 0;
+        nt_cache_2bcs[0][i] = WN;
+        nt_cache_2bcs[1][i] = WN;
+        t_cache_LRU[i] = 0;
+        nt_cache_LRU[i] = 0;
+    }
+    ghistory = 0;
+}
+
+int cache_lookup(uint8_t **target_cache_tags, uint32_t cache_index, uint32_t pc_tag) {
+
+    for(int i=0;i<2;++i) {
+        uint8_t cache_tag = target_cache_tags[i][cache_index];
+        if(cache_tag == pc_tag) return i;
+    }
+    return -1;
+}
+
+int cache_hit_cnt=0, cache_miss_cnt=0, verbose_cnt=0;
+
+void cache_update(uint8_t **target_cache_tags, uint8_t **target_cache_2bcs, uint8_t *target_LRU,
+                  uint32_t cache_index, uint32_t pc_tag, uint8_t outcome) {
+    int hit_way = cache_lookup(target_cache_tags, cache_index, pc_tag);
+    if(hit_way!=-1) {
+        ++cache_hit_cnt;
+        saturate_counter_update(&target_cache_2bcs[hit_way][cache_index], outcome);
+        target_LRU[cache_index] = hit_way ^ 1;
+    }
+    else {
+        ++cache_miss_cnt;
+        target_cache_tags[target_LRU[cache_index]][cache_index] = pc_tag;
+        target_cache_2bcs[target_LRU[cache_index]][cache_index] = outcome ? WT : WN;
+        target_LRU[cache_index] ^= 1;
+    }
+}
+
+int pred_verbose_cnt=0;
+
+
+uint8_t custom_predict(uint32_t pc) {
+    uint32_t choice_index = get_lower_bits(pc, custom_history_bits);
+    uint8_t choice = saturate_counter_predict(choicebht_custom[choice_index]);
+    uint32_t cache_key = get_lower_bits(pc, custom_history_bits) ^ get_lower_bits(ghistory, custom_history_bits);
+    uint32_t cache_index = get_lower_bits(cache_key, custom_cache_bits), pc_tag = get_lower_bits(pc, custom_cache_tag_bits);
+    uint8_t **target_cache_tags = choice?nt_cache_tags:t_cache_tags, *target_LRU = choice?nt_cache_LRU:t_cache_LRU;
+    uint8_t **target_cache_2bcs = choice?nt_cache_2bcs:t_cache_2bcs;
+    int hit_way = cache_lookup(target_cache_tags, cache_index, pc_tag);
+
+    if(hit_way!=-1) {
+        //if(verbose_cnt<200)
+        //if(verbose_cnt>=1000000 && verbose_cnt<1000200)
+        //    printf("pred: hit, index=%d, answer=%d\n", cache_index, saturate_counter_predict(target_cache_2bcs[hit_way][cache_index]));
+        return saturate_counter_predict(target_cache_2bcs[hit_way][cache_index]);
+    }
+    else {
+        //if(verbose_cnt<200)
+
+        //if(verbose_cnt>=1000000 && verbose_cnt<1000200)
+        //    printf("pred: mis, index=%d, answer=%d\n", cache_index, choice);
+
+        return choice;
+    }
+}
+
+int choice_correct_cnt=0;
+
+void train_custom(uint32_t pc, uint8_t outcome) {
+    verbose_cnt++;
+    //if(verbose_cnt<200)
+
+    //if(verbose_cnt>=1000000 && verbose_cnt<1000200)
+    //    printf("pc=%d, outcome=%d\n", pc, outcome);
+
+    uint32_t choice_index = get_lower_bits(pc, custom_history_bits);
+    uint8_t choice = saturate_counter_predict(choicebht_custom[choice_index]);
+    uint32_t cache_key = get_lower_bits(pc, custom_history_bits) ^ get_lower_bits(ghistory, custom_history_bits);
+    uint32_t cache_index = get_lower_bits(cache_key, custom_cache_bits), pc_tag = get_lower_bits(pc, custom_cache_tag_bits);
+    uint8_t **target_cache_tags = choice?nt_cache_tags:t_cache_tags, *target_LRU = choice?nt_cache_LRU:t_cache_LRU;
+    uint8_t **target_cache_2bcs = choice?nt_cache_2bcs:t_cache_2bcs;
+
+    if(choice != outcome || cache_lookup(target_cache_tags, cache_index, pc_tag)!=-1) {
+        cache_update(target_cache_tags, target_cache_2bcs, target_LRU, cache_index, pc_tag, outcome);
+    }
+    else {
+        ++choice_correct_cnt;
+        //if(verbose_cnt<200)
+        //    printf("choice is correct\n");
+    }
+
+    saturate_counter_update(&choicebht_custom[choice_index], outcome);
+
+    //Update history register
+    ghistory = ((ghistory << 1) | outcome);
+
+    if(verbose_cnt%100000==0){
+        //printf("hit rate: %.3f\n", ((float)cache_hit_cnt)/verbose_cnt);
+        //printf("choice correct rate: %.3f\n", ((float)choice_correct_cnt)/verbose_cnt);
+    }
+}
+
+void cleanup_custom() {
+    free(choicebht_custom);
+    free(t_cache_tags[0]);
+    free(t_cache_tags[1]);
+    free(t_cache_2bcs[0]);
+    free(t_cache_2bcs[1]);
+    free(nt_cache_tags[0]);
+    free(nt_cache_tags[1]);
+    free(nt_cache_2bcs[0]);
+    free(nt_cache_2bcs[1]);
+    free(t_cache_LRU);
+    free(nt_cache_LRU);
+}
+
 
 void init_predictor() {
     switch (bpType) {
@@ -224,6 +368,8 @@ void init_predictor() {
             init_tournament();
             break;
         case CUSTOM:
+            init_custom();
+            break;
         default:
             break;
     }
@@ -245,6 +391,7 @@ uint8_t make_prediction(uint32_t pc) {
         case TOURNAMENT:
             return tournament_predict(pc);
         case CUSTOM:
+            return custom_predict(pc);
         default:
             break;
     }
@@ -267,6 +414,7 @@ void train_predictor(uint32_t pc, uint8_t outcome) {
         case TOURNAMENT:
             return train_tournament(pc, outcome);
         case CUSTOM:
+            return train_custom(pc, outcome);
         default:
             break;
     }
